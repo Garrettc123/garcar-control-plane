@@ -1,16 +1,12 @@
-"""
-HuggingFace Spaces — Garcar Lead Scorer API.
-Deploy as a Gradio/FastAPI Space. HuggingFace Spaces auto-serves `app.py` on port 7860.
-
-Endpoints:
-  POST /score  — returns MAUT score, tier, routing, and per-dimension breakdown
-  GET  /health — liveness probe
-"""
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional
+import httpx
 
 app = FastAPI(title="Garcar Lead Scorer", version="1.0.0")
+
+APOLLO_ENROLL_URL = os.environ.get("APOLLO_ENROLL_URL", "")
 
 HOT_INDUSTRIES = {
     "construction", "roofing", "hvac", "plumbing",
@@ -27,13 +23,14 @@ MAUT_WEIGHTS = {
 
 
 class LeadInput(BaseModel):
-    name:      Optional[str] = None
-    email:     Optional[str] = None
-    company:   Optional[str] = None
-    industry:  Optional[str] = None
-    employees: Optional[int] = 0
-    message:   Optional[str] = None
-    source:    Optional[str] = "organic"
+    name:         Optional[str] = None
+    email:        Optional[str] = None
+    company:      Optional[str] = None
+    industry:     Optional[str] = None
+    employees:    Optional[int] = 0
+    message:      Optional[str] = None
+    source:       Optional[str] = "organic"
+    utm_campaign: Optional[str] = None
 
 
 class LeadScore(BaseModel):
@@ -43,8 +40,28 @@ class LeadScore(BaseModel):
     explanation: dict
 
 
+async def _fire_apollo_enroll(lead: LeadInput, tier: str) -> None:
+    if not APOLLO_ENROLL_URL or not lead.email:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{APOLLO_ENROLL_URL}/enroll",
+                json={
+                    "name":         lead.name,
+                    "email":        lead.email,
+                    "company":      lead.company,
+                    "industry":     lead.industry,
+                    "tier":         tier,
+                    "utm_campaign": lead.utm_campaign,
+                },
+            )
+    except Exception as exc:
+        print(f"[apollo-enroll] fire failed for {lead.email}: {exc}")
+
+
 @app.post("/score", response_model=LeadScore)
-def score_lead(lead: LeadInput) -> LeadScore:
+async def score_lead(lead: LeadInput, background_tasks: BackgroundTasks) -> LeadScore:
     company_score  = 1.0 if lead.company else 0.0
     industry       = (lead.industry or "").lower()
     industry_score = 1.0 if any(h in industry for h in HOT_INDUSTRIES) else 0.4
@@ -64,6 +81,7 @@ def score_lead(lead: LeadInput) -> LeadScore:
     if score >= 0.75:
         tier  = "Hot"
         route = "Notion CRM + Slack immediate + Apollo sequence A"
+        background_tasks.add_task(_fire_apollo_enroll, lead, tier)
     elif score >= 0.45:
         tier  = "Warm"
         route = "Notion CRM + Slack summary digest"
