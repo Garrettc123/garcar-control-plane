@@ -1,0 +1,14 @@
+name: RHNS Cognitive Core Deployment
+
+on:
+  push:
+    branches: [main]
+    paths: ['rhns/**', 'migrations/**', '.github/workflows/**']
+
+jobs:
+  verify-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Health Check Placeholder
+        run: echo "RHNS deployment pipeline initialized — June 24 2026"

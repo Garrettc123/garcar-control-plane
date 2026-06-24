@@ -1,0 +1,8 @@
+# Ignore everything in parent home directory bleed
+.nvm/
+node_modules/
+*.zip
+*.tgz
+awscliv2.zip
+terraform_*.zip
+ngrok-*.zip
