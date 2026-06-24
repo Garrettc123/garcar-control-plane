@@ -6,3 +6,5 @@ node_modules/
 awscliv2.zip
 terraform_*.zip
 ngrok-*.zip
+.env
+*.env

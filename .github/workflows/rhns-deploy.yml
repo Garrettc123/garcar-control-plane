@@ -3,12 +3,62 @@ name: RHNS Cognitive Core Deployment
 on:
   push:
     branches: [main]
-    paths: ['rhns/**', 'migrations/**', '.github/workflows/**']
+    paths:
+      - 'rhns/**'
+      - 'migrations/**'
+      - 'requirements.txt'
+      - 'nixpacks.toml'
+      - '.github/workflows/**'
 
 jobs:
-  verify-and-deploy:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Health Check Placeholder
-        run: echo "RHNS deployment pipeline initialized — June 24 2026"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install fastapi pydantic pytest pytest-asyncio
+
+      - name: Run Symbolic Verifier Tests
+        run: pytest tests/symbolic_verifier/ -v --tb=short
+
+      - name: Run Governance Tests
+        run: pytest tests/failure_ontology/ -v --tb=short
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy Cognitive Core
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service rhns-cognitive-core
+
+      - name: Post-deploy smoke test
+        run: |
+          sleep 15
+          curl -f ${{ secrets.RHNS_URL }}/health || exit 1
+
+      - name: Log deployment episode
+        run: |
+          curl -s -X POST ${{ secrets.RHNS_URL }}/cognitive/cycle \
+            -H "Content-Type: application/json" \
+            -d '{
+              "agent_id": "deployment-agent",
+              "goal_context": "system_self_deployment",
+              "current_stage": "reflection",
+              "working_memory": {"trigger": "github_push", "branch": "main"},
+              "belief_updates": [],
+              "metacognitive_signals": ["deployment_complete"]
+            }' | echo "Deployment episode logged"
