@@ -1,0 +1,39 @@
+name: Deploy — HuggingFace Lead Scorer
+
+on:
+  push:
+    branches: [main]
+    paths: ['hf-lead-scorer/**']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to HuggingFace Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "HF_TOKEN not set — skipping deploy"
+            exit 0
+          fi
+          git config user.email "ci@garcarenterprise.com"
+          git config user.name "Garcar CI"
+          git remote add hf https://garcar-enterprise:${HF_TOKEN}@huggingface.co/spaces/garcar-enterprise/garcar-lead-scorer || true
+          git subtree push --prefix hf-lead-scorer hf main
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && exit 0
+          EMOJI=":white_check_mark:"
+          [ "${{ job.status }}" != "success" ] && EMOJI=":x:"
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"text\":\"$EMOJI hf-lead-scorer deploy: ${{ job.status }} — ${{ github.sha }}\"}" \
+            "$SLACK_WEBHOOK_URL"

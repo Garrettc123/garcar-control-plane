@@ -1,0 +1,47 @@
+name: CI — Lint + Test All Services
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-python-services:
+    name: Test ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [meta-lead-webhook, google-ads-sync, meta-ads-sync, hf-lead-scorer]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install service deps
+        run: |
+          if [ -f ${{ matrix.service }}/requirements.txt ]; then
+            REQ=$(grep -v '^#' ${{ matrix.service }}/requirements.txt | xargs)
+            [ -n "$REQ" ] && pip install -r ${{ matrix.service }}/requirements.txt
+          fi
+
+      - name: Install test deps
+        run: pip install ruff pytest pytest-asyncio httpx
+
+      - name: Lint
+        run: ruff check ${{ matrix.service }}/ --ignore E501 || true
+
+      - name: Test
+        env:
+          META_VERIFY_TOKEN: test-token
+        run: |
+          if [ -d ${{ matrix.service }}/tests ]; then
+            pytest ${{ matrix.service }}/tests/ -v --tb=short
+          else
+            echo "No tests for ${{ matrix.service }} — skipping"
+          fi

@@ -1,0 +1,50 @@
+name: Deploy — Meta Lead Webhook
+
+on:
+  push:
+    branches: [main]
+    paths: ['meta-lead-webhook/**']
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        working-directory: meta-lead-webhook
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service meta-lead-webhook --detach
+
+      - name: Health check
+        env:
+          SERVICE_URL: ${{ secrets.META_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SERVICE_URL" ]; then
+            echo "META_WEBHOOK_URL not set — skipping health check"
+            exit 0
+          fi
+          for i in 1 2 3 4; do
+            STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$SERVICE_URL/health" || echo "000")
+            echo "Attempt $i — HTTP $STATUS"
+            [ "$STATUS" = "200" ] && exit 0
+            sleep 20
+          done
+          echo "Health check failed after 4 attempts"
+          exit 1
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && exit 0
+          EMOJI=":white_check_mark:"
+          [ "${{ job.status }}" != "success" ] && EMOJI=":x:"
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d "{\"text\":\"$EMOJI meta-lead-webhook deploy: ${{ job.status }} — ${{ github.sha }}\"}" \
+            "$SLACK_WEBHOOK_URL"

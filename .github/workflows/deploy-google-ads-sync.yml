@@ -1,0 +1,39 @@
+name: Deploy — Google Ads Sync
+
+on:
+  push:
+    branches: [main]
+    paths: ['google-ads-sync/**']
+  schedule:
+    - cron: '0 8 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Google Ads sync
+        working-directory: google-ads-sync
+        env:
+          GOOGLE_ADS_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_ADS_DEVELOPER_TOKEN }}
+          GOOGLE_ADS_CUSTOMER_ID:     ${{ secrets.GOOGLE_ADS_CUSTOMER_ID }}
+          GOOGLE_OAUTH_ACCESS_TOKEN:  ${{ secrets.GOOGLE_OAUTH_ACCESS_TOKEN }}
+          SUPABASE_URL:               ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:       ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SLACK_WEBHOOK_URL:          ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python main.py
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$SLACK_WEBHOOK_URL" ] && exit 0
+          curl -s -X POST -H "Content-Type: application/json" \
+            -d '{"text":":x: google-ads-sync failed — ${{ github.sha }}"}' \
+            "$SLACK_WEBHOOK_URL"
