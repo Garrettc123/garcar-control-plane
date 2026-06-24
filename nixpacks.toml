@@ -1,0 +1,8 @@
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[phases.build]
+cmds = ["echo 'RHNS build complete'"]
+
+[start]
+cmd = "uvicorn rhns.core.cognitive_cycle:app --host 0.0.0.0 --port $PORT"
