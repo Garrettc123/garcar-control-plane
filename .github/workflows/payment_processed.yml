@@ -1,0 +1,35 @@
+name: Payment Processed (Control Plane)
+
+on:
+  repository_dispatch:
+    types: [payment_processed]
+
+jobs:
+  update-cognitive-state:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TRACE_ID:          ${{ github.event.client_payload.trace_id }}
+      STRIPE_EVENT_ID:   ${{ github.event.client_payload.stripe_event_id }}
+      STRIPE_EVENT_TYPE: ${{ github.event.client_payload.stripe_event_type }}
+      CUSTOMER_EMAIL:    ${{ github.event.client_payload.customer_email }}
+      AMOUNT_TOTAL:      ${{ github.event.client_payload.amount_total }}
+      SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      RHNS_API_URL:         ${{ secrets.RHNS_API_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Update cognitive state
+        run: python scripts/on_payment_processed.py
