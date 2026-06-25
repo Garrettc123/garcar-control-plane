@@ -1,0 +1,52 @@
+name: System Health Monitor
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all services and emit alerts for any that are down
+        env:
+          DISPATCH_URL: ${{ secrets.DISPATCH_URL }}
+          DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
+          RHNS_URL: ${{ secrets.RHNS_URL }}
+          ATLAS_URL: ${{ secrets.ATLAS_URL }}
+          PAYMENTS_URL: ${{ secrets.PAYMENTS_API_URL }}
+        run: |
+          if [ -z "$DISPATCH_URL" ]; then
+            echo "DISPATCH_URL not configured — skipping"
+            exit 0
+          fi
+
+          emit_alert() {
+            local name="$1" url="$2" code="$3"
+            BODY=$(printf \
+              '{"event_type":"rhns.service_down","source_system":"health-monitor","severity":"critical","service":"%s","error":"HTTP %s from health endpoint","payload":{"url":"%s","http_code":"%s"}}' \
+              "$name" "$code" "$url" "$code")
+            SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "${DISPATCH_SECRET:-placeholder}" -hex | awk '{print $2}')
+            curl -sf -X POST "$DISPATCH_URL/dispatch" \
+              -H "Content-Type: application/json" \
+              -H "X-Dispatch-Sig: $SIG" \
+              -d "$BODY" || echo "Alert emit failed"
+            echo "ALERT: $name is down (HTTP $code)"
+          }
+
+          check() {
+            local name="$1" url="$2"
+            [[ -z "$url" ]] && return
+            local code
+            code=$(curl -sf --max-time 10 "$url/health" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "OK: $name"
+            else
+              emit_alert "$name" "$url" "$code"
+            fi
+          }
+
+          check "garcar-dispatch"   "$DISPATCH_URL"
+          check "garcar-rhns-core"  "$RHNS_URL"
+          check "atlas-dispatch"    "$ATLAS_URL"
+          check "garcar-payments"   "$PAYMENTS_URL"
