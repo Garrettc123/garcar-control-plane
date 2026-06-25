@@ -1,0 +1,433 @@
+# ============================================================
+# GARCAR ENTERPRISE — IRAS REVENUE PIPELINE
+# Integrated Revenue Automation System
+# Full 7-Agent Chain: Prospect → Enrich → Outreach → Score
+#                     → Convert → Bill → Onboard
+# ============================================================
+
+name: IRAS Revenue Pipeline
+
+on:
+  schedule:
+    - cron: '0 11 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      start_step:
+        description: 'Start from step (1=Prospect, 2=Enrich, 3=Outreach, 4=Score, 5=Convert, 6=Bill, 7=Onboard)'
+        required: false
+        default: '1'
+        type: choice
+        options: ['1','2','3','4','5','6','7']
+      lead_limit:
+        description: 'Max leads to prospect (default 50)'
+        required: false
+        default: '50'
+      dry_run:
+        description: 'Dry run — skip all external writes/emails/charges'
+        required: false
+        default: 'false'
+        type: boolean
+
+  repository_dispatch:
+    types:
+      - stripe_payment_succeeded
+      - stripe_checkout_completed
+      - sendgrid_email_opened
+      - sendgrid_link_clicked
+      - sendgrid_suppressed
+      - hot_lead_flagged
+      - lead_enriched
+
+env:
+  SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+  PERPLEXITY_API_KEY:   ${{ secrets.PERPLEXITY_API_KEY }}
+  ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+  SENDGRID_API_KEY:     ${{ secrets.SENDGRID_API_KEY }}
+  SENDGRID_FROM_EMAIL:  ${{ secrets.SENDGRID_FROM_EMAIL }}
+  STRIPE_SECRET_KEY:    ${{ secrets.STRIPE_SECRET_KEY }}
+  STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+  CALENDLY_TOKEN:       ${{ secrets.CALENDLY_TOKEN }}
+  LINEAR_API_KEY:       ${{ secrets.LINEAR_API_KEY }}
+  LINEAR_TEAM_ID:       ${{ secrets.LINEAR_TEAM_ID }}
+  GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+  HOT_LEAD_THRESHOLD:   '80'
+  TARGET_MARKET:        'DFW_contractors'
+  DRY_RUN:              ${{ github.event.inputs.dry_run || 'false' }}
+
+concurrency:
+  group: iras-pipeline-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+
+  prospect:
+    name: 'Step 1 — Prospecting Agent'
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'schedule') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '1') ||
+      (github.event_name == 'repository_dispatch' && github.event.action == 'trigger_prospecting')
+    outputs:
+      leads_discovered: ${{ steps.prospect_run.outputs.leads_discovered }}
+      batch_id:         ${{ steps.prospect_run.outputs.batch_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet httpx beautifulsoup4 lxml supabase python-dotenv structlog
+      - name: Create batch record
+        id: create_batch
+        run: |
+          python - << 'EOF'
+          import os, uuid
+          from datetime import datetime, timezone
+          from supabase import create_client
+          batch_id = str(uuid.uuid4())
+          lead_limit = int("${{ github.event.inputs.lead_limit || '50' }}")
+          dry_run = os.environ["DRY_RUN"] == "true"
+          if not dry_run:
+              sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+              sb.table("iras_batches").insert({"id": batch_id, "status": "prospecting",
+                  "created_at": datetime.now(timezone.utc).isoformat(),
+                  "target_market": os.environ["TARGET_MARKET"], "lead_limit": lead_limit}).execute()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"batch_id={batch_id}\nlead_limit={lead_limit}\n")
+          EOF
+      - name: Run Prospecting Agent
+        id: prospect_run
+        env:
+          BATCH_ID: ${{ steps.create_batch.outputs.batch_id }}
+          LEAD_LIMIT: ${{ steps.create_batch.outputs.lead_limit }}
+        run: |
+          DRY_FLAG=""; [ "$DRY_RUN" = "true" ] && DRY_FLAG="--dry-run"
+          python scripts/iras_prospect.py --batch-id "$BATCH_ID" --limit "$LEAD_LIMIT" $DRY_FLAG
+      - run: |
+          echo "## Step 1 — Prospecting" >> $GITHUB_STEP_SUMMARY
+          echo "- Batch: ${{ steps.prospect_run.outputs.batch_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Leads: ${{ steps.prospect_run.outputs.leads_discovered }}" >> $GITHUB_STEP_SUMMARY
+
+  enrich:
+    name: 'Step 2 — Enrichment Agent'
+    runs-on: ubuntu-latest
+    needs: [prospect]
+    if: |
+      always() && (
+        (needs.prospect.result == 'success') ||
+        (github.event_name == 'repository_dispatch' && github.event.action == 'lead_enriched') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '2')
+      )
+    outputs:
+      enriched_leads: ${{ steps.enrich_run.outputs.enriched_leads }}
+      batch_id:       ${{ steps.enrich_run.outputs.batch_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet httpx openai supabase python-dotenv structlog
+      - name: Run Enrichment Agent
+        id: enrich_run
+        run: |
+          python - << 'EOF'
+          import os, json, httpx
+          from supabase import create_client
+          from openai import OpenAI
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          oc = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          batch_id = "${{ needs.prospect.outputs.batch_id || github.event.client_payload.batch_id }}"
+          leads = [] if dry_run else sb.table("iras_leads").select("*").eq("batch_id", batch_id).eq("status", "prospected").execute().data
+          count = 0
+          for lead in leads:
+              try:
+                  r = httpx.post("https://api.perplexity.ai/chat/completions",
+                      headers={"Authorization": f"Bearer {os.environ['PERPLEXITY_API_KEY']}"},
+                      json={"model": "sonar-pro", "messages": [{"role": "user", "content":
+                          f"Research DFW roofing contractor {lead.get('company_name','unknown')}. "
+                          f"Find owner name, pain signals, tech stack. JSON: {{owner_name,pain_signals,score_boost:0-20}}"}]}, timeout=20).json()
+                  pain = r.get("choices",[{}])[0].get("message",{}).get("content","{}")
+              except: pain = "{}"
+              try:
+                  p = json.loads(pain); owner = p.get("owner_name"); boost = min(int(p.get("score_boost",0)),20)
+              except: owner = None; boost = 0
+              sb.table("iras_leads").update({"status":"enriched","pain_data":pain,"enriched_at":"now()",
+                  "first_name": owner.split()[0] if owner else None,
+                  "last_name": " ".join(owner.split()[1:]) if owner and len(owner.split())>1 else None,
+                  "score": min(20+boost,40)}).eq("id",lead["id"]).execute()
+              count += 1
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f:
+              f.write(f"enriched_leads={count}\nbatch_id={batch_id}\n")
+          print(f"[ENRICH] {count} leads enriched")
+          EOF
+
+  outreach:
+    name: 'Step 3 — Outreach Agent'
+    runs-on: ubuntu-latest
+    needs: [enrich]
+    if: |
+      always() && (
+        (needs.enrich.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '3')
+      )
+    outputs:
+      emails_sent: ${{ steps.outreach_run.outputs.emails_sent }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet httpx openai supabase python-dotenv sendgrid structlog
+      - name: Run Outreach Agent
+        id: outreach_run
+        run: |
+          python - << 'EOF'
+          import os, json
+          from supabase import create_client
+          from openai import OpenAI
+          import sendgrid
+          from sendgrid.helpers.mail import Mail, CustomArg
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          oc = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+          sg = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          batch_id = "${{ needs.enrich.outputs.batch_id }}"
+          leads = [l for l in ([] if dry_run else sb.table("iras_leads").select("*").eq("batch_id",batch_id).eq("status","enriched").execute().data) if l.get("email")]
+          sent = 0
+          for lead in leads:
+              first = lead.get("first_name") or "there"; company = lead.get("company_name") or "your company"
+              try:
+                  body = oc.chat.completions.create(model="gpt-4o", messages=[
+                      {"role":"system","content":"DFW roofing outreach for Garcar Enterprise. Max 120 words. Specific opener. CTA: 15-min call."},
+                      {"role":"user","content":f"Day 0 for {first} at {company}. Pain: {lead.get('pain_data','{}')}"}
+                  ]).choices[0].message.content
+              except Exception as e: print(f"[OUTREACH] {e}"); continue
+              if not dry_run:
+                  try:
+                      m = Mail(from_email=os.environ["SENDGRID_FROM_EMAIL"], to_emails=lead["email"],
+                          subject=f"Quick question about your ops, {first}", plain_text_content=body)
+                      m.add_custom_arg(CustomArg("lead_id",lead["id"])); m.add_custom_arg(CustomArg("batch_id",batch_id)); m.add_custom_arg(CustomArg("sequence_day","0"))
+                      sg.send(m)
+                      sb.table("iras_leads").update({"status":"outreach_day0","outreach_enrolled_at":"now()","email_sequence":json.dumps([{"day":0},{"day":3},{"day":7},{"day":14}])}).eq("id",lead["id"]).execute()
+                      sent += 1
+                  except Exception as e: print(f"[OUTREACH] send error: {e}")
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f: f.write(f"emails_sent={sent}\n")
+          print(f"[OUTREACH] {sent} sent")
+          EOF
+
+  score:
+    name: 'Step 4 — Scoring Agent'
+    runs-on: ubuntu-latest
+    needs: [outreach]
+    if: |
+      always() && (
+        (needs.outreach.result == 'success') ||
+        (github.event_name == 'repository_dispatch' && (
+          github.event.action == 'sendgrid_email_opened' ||
+          github.event.action == 'sendgrid_link_clicked' ||
+          github.event.action == 'sendgrid_suppressed'
+        )) ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '4')
+      )
+    outputs:
+      hot_leads_count: ${{ steps.score_run.outputs.hot_leads_count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet httpx supabase python-dotenv structlog
+      - name: Run Scoring Agent
+        id: score_run
+        run: |
+          python - << 'EOF'
+          import os, httpx
+          from supabase import create_client
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          HOT = int(os.environ["HOT_LEAD_THRESHOLD"])
+          action = "${{ github.event.action }}"
+          event_name = os.environ.get("GITHUB_EVENT_NAME","")
+          if action == "sendgrid_suppressed":
+              lid = "${{ github.event.client_payload.lead_id }}"
+              if lid and not dry_run: sb.table("iras_leads").update({"status":"suppressed"}).eq("id",lid).execute()
+              open(os.environ["GITHUB_OUTPUT"],"a").write("hot_leads_count=0\n"); exit(0)
+          if event_name == "repository_dispatch" and action in ("sendgrid_email_opened","sendgrid_link_clicked"):
+              lid = "${{ github.event.client_payload.lead_id }}"
+              if lid and not dry_run:
+                  lead = sb.table("iras_leads").select("id,score,status").eq("id",lid).single().execute().data
+                  if lead:
+                      score = min(lead.get("score",20) + (15 if action=="sendgrid_link_clicked" else 10), 100)
+                      sb.table("iras_leads").update({"score":score,"status":"hot" if score>=HOT else lead["status"],"scored_at":"now()"}).eq("id",lid).execute()
+                      if score >= HOT:
+                          httpx.post("https://api.linear.app/graphql", headers={"Authorization":os.environ["LINEAR_API_KEY"]},
+                              json={"query":"mutation CreateIssue($input:IssueCreateInput!){issueCreate(input:$input){issue{id}}}",
+                              "variables":{"input":{"teamId":os.environ["LINEAR_TEAM_ID"],"title":f"HOT LEAD: {lid} score={score}","priority":1}}})
+                          open(os.environ["GITHUB_OUTPUT"],"a").write("hot_leads_count=1\n"); exit(0)
+              open(os.environ["GITHUB_OUTPUT"],"a").write("hot_leads_count=0\n"); exit(0)
+          leads = [] if dry_run else sb.table("iras_leads").select("*").in_("status",["outreach_day0","outreach_day3","outreach_day7","outreach_day14"]).execute().data
+          hot = sum(1 for l in leads if l.get("score",0)>=HOT and (sb.table("iras_leads").update({"status":"hot","scored_at":"now()"}).eq("id",l["id"]).execute() or True) and not dry_run)
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"hot_leads_count={hot}\n")
+          print(f"[SCORE] {hot} hot leads")
+          EOF
+
+  convert:
+    name: 'Step 5 — Conversion Agent'
+    runs-on: ubuntu-latest
+    needs: [score]
+    if: |
+      always() && (
+        (needs.score.result == 'success' && needs.score.outputs.hot_leads_count > 0) ||
+        (github.event_name == 'repository_dispatch' && github.event.action == 'hot_lead_flagged') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '5')
+      )
+    outputs:
+      demos_scheduled: ${{ steps.convert_run.outputs.demos_scheduled }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet httpx openai supabase python-dotenv sendgrid structlog
+      - name: Run Conversion Agent
+        id: convert_run
+        run: |
+          python - << 'EOF'
+          import os
+          from supabase import create_client
+          from openai import OpenAI
+          import sendgrid
+          from sendgrid.helpers.mail import Mail
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          oc = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+          sg = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          CALENDLY = "https://calendly.com/garcar-demo/15min"
+          hot_leads = [] if dry_run else sb.table("iras_leads").select("*").eq("status","hot").execute().data
+          demos = 0
+          for lead in hot_leads:
+              first = lead.get("first_name") or "there"; company = lead.get("company_name") or "your company"
+              try:
+                  body = oc.chat.completions.create(model="gpt-4o", messages=[
+                      {"role":"system","content":"Garcar Enterprise. Brief demo invite. Include Calendly. Max 80 words."},
+                      {"role":"user","content":f"Invite {first} at {company}. Score:{lead.get('score')}. Calendly:{CALENDLY}"}
+                  ]).choices[0].message.content
+              except: continue
+              if not dry_run:
+                  try:
+                      sg.send(Mail(from_email=os.environ["SENDGRID_FROM_EMAIL"],to_emails=lead["email"],
+                          subject=f"15 min for {first}",plain_text_content=body))
+                      sb.table("iras_leads").update({"status":"demo_invited","demo_invited_at":"now()"}).eq("id",lead["id"]).execute()
+                      demos += 1
+                  except: pass
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"demos_scheduled={demos}\n")
+          print(f"[CONVERT] {demos} demo invites sent")
+          EOF
+
+  bill:
+    name: 'Step 6 — Billing Agent'
+    runs-on: ubuntu-latest
+    needs: [convert]
+    if: |
+      always() && (
+        (github.event_name == 'repository_dispatch' && github.event.action == 'stripe_checkout_completed') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '6')
+      )
+    outputs:
+      invoices_created: ${{ steps.bill_run.outputs.invoices_created }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet stripe supabase python-dotenv httpx structlog
+      - name: Run Billing Agent
+        id: bill_run
+        run: |
+          python - << 'EOF'
+          import os, stripe
+          from supabase import create_client
+          stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          PRODUCTS = {
+              "garcar-audit-47":{"price":4700,"mode":"payment","name":"Starter Audit"},
+              "garcar-starter-497":{"price":49700,"mode":"payment","name":"Deep-Dive $497"},
+              "garcar-starter-500":{"price":50000,"mode":"subscription","name":"Starter $500/mo"},
+              "garcar-pro-2000":{"price":200000,"mode":"subscription","name":"Pro $2000/mo"},
+          }
+          lead_id = "${{ github.event.client_payload.lead_id || '' }}"
+          product_id = "${{ github.event.client_payload.product_id || 'garcar-starter-500' }}"
+          created = 0
+          if lead_id and not dry_run:
+              lead = sb.table("iras_leads").select("*").eq("id",lead_id).single().execute().data
+              prod = PRODUCTS.get(product_id, PRODUCTS["garcar-starter-500"])
+              custs = stripe.Customer.list(email=lead["email"]).data
+              cust = custs[0] if custs else stripe.Customer.create(email=lead["email"],name=f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),metadata={"lead_id":lead_id})
+              price = stripe.Price.create(unit_amount=prod["price"],currency="usd",recurring={"interval":"month"} if prod["mode"]=="subscription" else None,product_data={"name":prod["name"]})
+              pl = stripe.PaymentLink.create(line_items=[{"price":price.id,"quantity":1}],metadata={"lead_id":lead_id,"product_id":product_id})
+              sb.table("iras_leads").update({"status":"billing_sent","stripe_customer_id":cust.id,"payment_link":pl.url,"billed_at":"now()"}).eq("id",lead_id).execute()
+              created = 1; print(f"[BILL] {pl.url}")
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"invoices_created={created}\n")
+          EOF
+
+  onboard:
+    name: 'Step 7 — Onboarding Agent'
+    runs-on: ubuntu-latest
+    needs: [bill]
+    if: |
+      always() && (
+        (github.event_name == 'repository_dispatch' && github.event.action == 'stripe_payment_succeeded') ||
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '7')
+      )
+    outputs:
+      customers_onboarded: ${{ steps.onboard_run.outputs.customers_onboarded }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet stripe supabase httpx python-dotenv sendgrid openai structlog
+      - name: Run Onboarding Agent
+        id: onboard_run
+        run: |
+          python - << 'EOF'
+          import os, secrets, hashlib, httpx, stripe
+          from supabase import create_client
+          from openai import OpenAI
+          import sendgrid
+          from sendgrid.helpers.mail import Mail
+          stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          oc = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+          sg = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          scid = "${{ github.event.client_payload.stripe_customer_id || '' }}"
+          pid = "${{ github.event.client_payload.product_id || '' }}"
+          done = 0
+          if scid and not dry_run:
+              lead = sb.table("iras_leads").select("*").eq("stripe_customer_id",scid).single().execute().data
+              api_key = f"gce_{secrets.token_urlsafe(32)}"
+              sb.table("garcar_customers").insert({"stripe_customer_id":scid,"email":lead["email"],"first_name":lead.get("first_name"),"company":lead.get("company_name"),"plan":pid,"api_key_hash":hashlib.sha256(api_key.encode()).hexdigest(),"status":"active","onboarded_at":"now()"}).execute()
+              sb.table("iras_leads").update({"status":"customer","converted_at":"now()"}).eq("id",lead["id"]).execute()
+              first = lead.get("first_name") or "there"
+              welcome = oc.chat.completions.create(model="gpt-4o",messages=[{"role":"system","content":"Warm welcome email. Max 150 words. Include next steps."},{"role":"user","content":f"Welcome {first} at {lead.get('company_name')} to {pid}. API key: {api_key[:12]}... Dashboard: https://garcar.io/dashboard"}]).choices[0].message.content
+              sg.send(Mail(from_email=os.environ["SENDGRID_FROM_EMAIL"],to_emails=lead["email"],subject=f"Welcome to Garcar Enterprise, {first}",plain_text_content=welcome))
+              httpx.post("https://api.linear.app/graphql",headers={"Authorization":os.environ["LINEAR_API_KEY"]},json={"query":"mutation CreateIssue($input:IssueCreateInput!){issueCreate(input:$input){issue{id}}}","variables":{"input":{"teamId":os.environ["LINEAR_TEAM_ID"],"title":f"NEW CUSTOMER: {first} @ {lead.get('company_name')} — {pid}","priority":2}}})
+              done = 1; print(f"[ONBOARD] {lead.get('email')} on {pid}")
+          open(os.environ["GITHUB_OUTPUT"],"a").write(f"customers_onboarded={done}\n")
+          EOF
+
+  pipeline_report:
+    name: 'Pipeline Report'
+    runs-on: ubuntu-latest
+    needs: [prospect, enrich, outreach, score, convert, bill, onboard]
+    if: always()
+    steps:
+      - run: |
+          echo "# IRAS Pipeline — $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Result | Metric |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 1 Prospect | ${{ needs.prospect.result }} | ${{ needs.prospect.outputs.leads_discovered || 'n/a' }} leads |" >> $GITHUB_STEP_SUMMARY
+          echo "| 2 Enrich   | ${{ needs.enrich.result }}  | ${{ needs.enrich.outputs.enriched_leads || 'n/a' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 3 Outreach | ${{ needs.outreach.result }} | ${{ needs.outreach.outputs.emails_sent || 'n/a' }} sent |" >> $GITHUB_STEP_SUMMARY
+          echo "| 4 Score    | ${{ needs.score.result }}   | ${{ needs.score.outputs.hot_leads_count || 'n/a' }} hot |" >> $GITHUB_STEP_SUMMARY
+          echo "| 5 Convert  | ${{ needs.convert.result }} | ${{ needs.convert.outputs.demos_scheduled || 'n/a' }} demos |" >> $GITHUB_STEP_SUMMARY
+          echo "| 6 Bill     | ${{ needs.bill.result }}    | ${{ needs.bill.outputs.invoices_created || 'n/a' }} invoices |" >> $GITHUB_STEP_SUMMARY
+          echo "| 7 Onboard  | ${{ needs.onboard.result }} | ${{ needs.onboard.outputs.customers_onboarded || 'n/a' }} customers |" >> $GITHUB_STEP_SUMMARY

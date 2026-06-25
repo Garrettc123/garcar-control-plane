@@ -1,0 +1,79 @@
+name: IRAS Sequence Follow-up
+
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
+  SENDGRID_API_KEY:     ${{ secrets.SENDGRID_API_KEY }}
+  SENDGRID_FROM_EMAIL:  ${{ secrets.SENDGRID_FROM_EMAIL }}
+  DRY_RUN:              ${{ github.event.inputs.dry_run || 'false' }}
+
+jobs:
+  followup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11', cache: 'pip' }
+      - run: pip install --quiet httpx openai supabase python-dotenv sendgrid structlog
+      - name: Send follow-ups
+        id: followup_run
+        run: |
+          python - << 'EOF'
+          import os, json
+          from datetime import datetime, timezone, timedelta
+          from supabase import create_client
+          from openai import OpenAI
+          import sendgrid
+          from sendgrid.helpers.mail import Mail, CustomArg
+          sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+          oc = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+          sg = sendgrid.SendGridAPIClient(api_key=os.environ["SENDGRID_API_KEY"])
+          dry_run = os.environ["DRY_RUN"] == "true"
+          now = datetime.now(timezone.utc)
+          FOLLOWUPS = [
+              ("outreach_day0", 3, "outreach_day3", "The DFW contractor gap I keep seeing",
+               "Day 3. Mention DFW roofing contractors lose jobs to slow lead response. Soft CTA."),
+              ("outreach_day3", 7, "outreach_day7", "What 3 DFW contractors did in 30 days",
+               "Day 7 social proof. 3 contractors, 2 extra jobs/month, 10 hrs/week saved. CTA: 15-min call."),
+              ("outreach_day7", 14, "outreach_day14", "Closing the loop, {first_name}",
+               "Day 14 breakup. Short. Last email. Door open. One sentence CTA."),
+          ]
+          sent = skipped = 0
+          for cur_status, days, next_status, subj_tpl, hint in FOLLOWUPS:
+              cutoff = now - timedelta(days=days); cutoff_low = now - timedelta(days=days+1)
+              leads = [] if dry_run else sb.table("iras_leads").select("*").eq("status",cur_status).gte("outreach_enrolled_at",cutoff_low.isoformat()).lte("outreach_enrolled_at",cutoff.isoformat()).execute().data
+              if dry_run:
+                  sample = sb.table("iras_leads").select("*").eq("status",cur_status).limit(3).execute().data
+                  print(f"[FOLLOWUP] DRY {cur_status}->{next_status} sample={len(sample)}"); continue
+              for lead in leads:
+                  if not lead.get("email"): skipped += 1; continue
+                  first = lead.get("first_name") or "there"; company = lead.get("company_name") or "your company"
+                  subj = subj_tpl.replace("{first_name}",first)
+                  try:
+                      body = oc.chat.completions.create(model="gpt-4o",messages=[
+                          {"role":"system","content":"Garcar Enterprise follow-up emails for DFW roofing owners. Max 100 words. Conversational."},
+                          {"role":"user","content":f"For {first} at {company}. {hint}"}
+                      ]).choices[0].message.content
+                  except: skipped += 1; continue
+                  try:
+                      m = Mail(from_email=os.environ["SENDGRID_FROM_EMAIL"],to_emails=lead["email"],subject=subj,plain_text_content=body)
+                      m.add_custom_arg(CustomArg("lead_id",lead["id"])); m.add_custom_arg(CustomArg("sequence_day",next_status.split("day")[1]))
+                      sg.send(m)
+                      sb.table("iras_leads").update({"status":next_status}).eq("id",lead["id"]).execute()
+                      sent += 1
+                  except: skipped += 1
+          print(f"[FOLLOWUP] sent={sent} skipped={skipped}")
+          with open(os.environ["GITHUB_OUTPUT"],"a") as f: f.write(f"emails_sent={sent}\nemails_skipped={skipped}\n")
+          EOF
