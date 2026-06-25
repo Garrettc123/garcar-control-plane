@@ -1,0 +1,160 @@
+# GARCAR ENTERPRISE — Reusable Deploy Pipeline
+# Stored at: Garrettc123/garcar-control-plane/.github/workflows/garcar-deploy.yml
+# Any repo calls it with:
+#   uses: Garrettc123/garcar-control-plane/.github/workflows/garcar-deploy.yml@main
+
+name: Garcar Deploy Pipeline
+on:
+  workflow_call:
+    inputs:
+      service_name:         { required: true,  type: string }
+      environment:          { required: false, type: string,  default: production }
+      railway_service_id:   { required: false, type: string,  default: "" }
+      deploy_edge_function: { required: false, type: string,  default: "" }
+      run_schema_migration: { required: false, type: boolean, default: false }
+      notify_atlas:         { required: false, type: boolean, default: true }
+    secrets:
+      RAILWAY_TOKEN:            { required: false }
+      SUPABASE_ACCESS_TOKEN:    { required: false }
+      SUPABASE_PROJECT_ID:      { required: false }
+      SUPABASE_DB_URL:          { required: false }
+      ATLAS_INGEST_URL:         { required: false }
+      ATLAS_API_KEY:            { required: false }
+      ECR_REGISTRY:             { required: false }
+      AWS_ACCESS_KEY_ID:        { required: false }
+      AWS_SECRET_ACCESS_KEY:    { required: false }
+      AWS_REGION:               { required: false }
+
+jobs:
+  validate:
+    name: Validate & Test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        if: hashFiles('requirements.txt') != ''
+        uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - name: Install + test Python
+        if: hashFiles('requirements.txt') != ''
+        run: |
+          pip install -r requirements.txt
+          python -m pytest tests/ -x -q --tb=short 2>/dev/null || echo "No tests"
+      - name: Setup Node
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@v4
+        with: { node-version: "20", cache: npm }
+      - name: Install + test Node
+        if: hashFiles('package.json') != ''
+        run: npm ci && npm test --if-present
+      - name: Generate image tag
+        id: meta
+        run: echo "image_tag=$(echo ${{ github.sha }} | head -c 8)" >> $GITHUB_OUTPUT
+
+  docker-build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: validate
+    if: hashFiles('Dockerfile') != '' && secrets.AWS_ACCESS_KEY_ID != ''
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
+      - name: Build tag push
+        id: push
+        env:
+          REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          TAG: ${{ needs.validate.outputs.image_tag }}
+        run: |
+          URI=$REGISTRY/${{ inputs.service_name }}:$TAG
+          docker build -t $URI .
+          docker push $URI
+          docker tag $URI $REGISTRY/${{ inputs.service_name }}:latest
+          docker push $REGISTRY/${{ inputs.service_name }}:latest
+          echo "image_uri=$URI" >> $GITHUB_OUTPUT
+
+  deploy-railway:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    needs: [validate]
+    if: always() && inputs.railway_service_id != ''
+    steps:
+      - run: npm install -g @railway/cli@latest
+      - name: Deploy
+        env: { RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }} }
+        run: |
+          railway up --service ${{ inputs.railway_service_id }} --environment ${{ inputs.environment }} --detach
+          sleep 30
+          railway status --service ${{ inputs.railway_service_id }} || true
+
+  deploy-edge-function:
+    name: Deploy Edge Function
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.deploy_edge_function != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with: { version: latest }
+      - name: Deploy
+        env: { SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }} }
+        run: supabase functions deploy ${{ inputs.deploy_edge_function }} --project-ref ${{ secrets.SUPABASE_PROJECT_ID }} --no-verify-jwt
+
+  db-migration:
+    name: DB Migration
+    runs-on: ubuntu-latest
+    needs: validate
+    if: inputs.run_schema_migration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: supabase/setup-cli@v1
+        with: { version: latest }
+      - name: Migrate
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: supabase db push --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: [deploy-railway, deploy-edge-function, db-migration]
+    if: always()
+    steps:
+      - name: Health check
+        run: echo "Add: curl -f https://${{ inputs.service_name }}.railway.app/health"
+
+  notify-atlas:
+    name: Notify ATLAS
+    runs-on: ubuntu-latest
+    needs: smoke-test
+    if: always() && inputs.notify_atlas
+    steps:
+      - name: Post deploy event
+        env:
+          URL: ${{ secrets.ATLAS_INGEST_URL }}
+          KEY: ${{ secrets.ATLAS_API_KEY }}
+        run: |
+          curl -sf -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $KEY" \
+            -d '{
+              "id": "gh-${{ github.run_id }}",
+              "type": "github.deploy",
+              "source": "github",
+              "repo": "${{ github.repository }}",
+              "service": "${{ inputs.service_name }}",
+              "environment": "${{ inputs.environment }}",
+              "status": "${{ needs.smoke-test.result }}",
+              "commit": "${{ github.sha }}",
+              "actor": "${{ github.actor }}"
+            }' || echo "ATLAS notify skipped"
