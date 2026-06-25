@@ -3,17 +3,14 @@
 # Integrated Revenue Automation System
 # Full 7-Agent Chain: Prospect → Enrich → Outreach → Score
 #                     → Convert → Bill → Onboard
-# Owner: Garrett Wayne Carrol — Garcar Enterprise
 # ============================================================
 
 name: IRAS Revenue Pipeline
 
 on:
-  # ── Scheduled: daily prospecting sweep ──
   schedule:
-    - cron: '0 11 * * 1-5'    # 6AM CDT Mon–Fri (UTC-5)
+    - cron: '0 11 * * 1-5'    # 6AM CDT Mon–Fri
 
-  # ── Manual trigger with runtime overrides ──
   workflow_dispatch:
     inputs:
       start_step:
@@ -32,51 +29,37 @@ on:
         default: 'false'
         type: boolean
 
-  # ── Stripe webhook → trigger billing or onboarding ──
   repository_dispatch:
     types:
-      - stripe_payment_succeeded   # → Step 7: Onboard
-      - stripe_checkout_completed  # → Step 6: Bill
-      - sendgrid_email_opened      # → Step 4: Score update
-      - sendgrid_link_clicked      # → Step 4: Score update (hot signal)
-      - hot_lead_flagged           # → Step 5: Convert
-      - lead_enriched              # → Step 2: Enrich complete, trigger Step 3
+      - stripe_payment_succeeded
+      - stripe_checkout_completed
+      - sendgrid_email_opened
+      - sendgrid_link_clicked
+      - sendgrid_suppressed
+      - hot_lead_flagged
+      - lead_enriched
 
 env:
-  # ── Platform ──
   RAILWAY_TOKEN:        ${{ secrets.RAILWAY_TOKEN }}
   SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
   SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-
-  # ── AI / Enrichment ──
   OPENAI_API_KEY:       ${{ secrets.OPENAI_API_KEY }}
   PERPLEXITY_API_KEY:   ${{ secrets.PERPLEXITY_API_KEY }}
   ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
-
-  # ── Outreach ──
   SENDGRID_API_KEY:     ${{ secrets.SENDGRID_API_KEY }}
   SENDGRID_FROM_EMAIL:  ${{ secrets.SENDGRID_FROM_EMAIL }}
-  SMTP_HOST:            ${{ secrets.SMTP_HOST }}
-  SMTP_USER:            ${{ secrets.SMTP_USER }}
-  SMTP_PASS:            ${{ secrets.SMTP_PASS }}
-
-  # ── Revenue / Payments ──
   STRIPE_SECRET_KEY:    ${{ secrets.STRIPE_SECRET_KEY }}
   STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
   CALENDLY_TOKEN:       ${{ secrets.CALENDLY_TOKEN }}
-
-  # ── Project Management ──
   LINEAR_API_KEY:       ${{ secrets.LINEAR_API_KEY }}
   LINEAR_TEAM_ID:       ${{ secrets.LINEAR_TEAM_ID }}
   NOTION_TOKEN:         ${{ secrets.NOTION_TOKEN }}
   NOTION_DB_LEADS:      ${{ secrets.NOTION_DB_LEADS }}
-
-  # ── Pipeline config ──
+  GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
   HOT_LEAD_THRESHOLD:   '80'
   TARGET_MARKET:        'DFW_contractors'
   DRY_RUN:              ${{ github.event.inputs.dry_run || 'false' }}
 
-# ── Prevent concurrent pipeline runs (except scoring webhooks) ──
 concurrency:
   group: iras-pipeline-${{ github.event_name }}
   cancel-in-progress: false
@@ -85,12 +68,9 @@ jobs:
 
   # ============================================================
   # STEP 1 — PROSPECTING AGENT
-  # Scrape 50+ DFW contractor leads (name, email, phone, LinkedIn)
-  # Trigger: Manual / cron schedule
-  # Output:  leads written to Supabase + Linear issue created
   # ============================================================
   prospect:
-    name: '🔍 Step 1 — Prospecting Agent'
+    name: 'Step 1 — Prospecting Agent'
     runs-on: ubuntu-latest
     if: |
       (github.event_name == 'schedule') ||
@@ -113,32 +93,23 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --quiet \
-            httpx playwright beautifulsoup4 lxml \
-            supabase python-dotenv pydantic \
-            openai anthropic \
-            uuid6 structlog
+            httpx beautifulsoup4 lxml \
+            supabase python-dotenv structlog
 
-      - name: Install Playwright browsers
-        run: python -m playwright install chromium --with-deps
-
-      - name: Run Prospecting Agent
-        id: prospect_run
+      - name: Create batch record
+        id: create_batch
         run: |
           python - << 'EOF'
-          import os, json, uuid, httpx, asyncio
+          import os, uuid
           from datetime import datetime, timezone
           from supabase import create_client
 
-          supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
           batch_id = str(uuid.uuid4())
           lead_limit = int("${{ github.event.inputs.lead_limit || '50' }}")
           dry_run = os.environ["DRY_RUN"] == "true"
 
-          print(f"[PROSPECT] Batch {batch_id} | limit={lead_limit} | dry_run={dry_run}")
-
-          leads_discovered = 0
-
           if not dry_run:
+              supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
               supabase.table("iras_batches").insert({
                   "id": batch_id,
                   "status": "prospecting",
@@ -147,34 +118,23 @@ jobs:
                   "lead_limit": lead_limit
               }).execute()
 
-              leads_discovered = lead_limit
-
-              supabase.table("iras_batches").update({
-                  "leads_discovered": leads_discovered,
-                  "status": "prospected"
-              }).eq("id", batch_id).execute()
-
-          if not dry_run:
-              linear_mutation = '''
-              mutation CreateIssue($input: IssueCreateInput!) {
-                  issueCreate(input: $input) { issue { id identifier } }
-              }'''
-              httpx.post("https://api.linear.app/graphql",
-                  headers={"Authorization": os.environ["LINEAR_API_KEY"]},
-                  json={"query": linear_mutation, "variables": {"input": {
-                      "teamId": os.environ["LINEAR_TEAM_ID"],
-                      "title": f"[IRAS] Prospecting batch {batch_id[:8]} — {leads_discovered} leads",
-                      "description": f"Batch ID: {batch_id}\nMarket: DFW contractors\nLeads: {leads_discovered}",
-                      "priority": 2
-                  }}}
-              )
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"leads_discovered={leads_discovered}\n")
               f.write(f"batch_id={batch_id}\n")
-
-          print(f"[PROSPECT] Done — {leads_discovered} leads, batch_id={batch_id}")
+              f.write(f"lead_limit={lead_limit}\n")
           EOF
+
+      - name: Run Prospecting Agent
+        id: prospect_run
+        env:
+          BATCH_ID: ${{ steps.create_batch.outputs.batch_id }}
+          LEAD_LIMIT: ${{ steps.create_batch.outputs.lead_limit }}
+        run: |
+          DRY_FLAG=""
+          [ "$DRY_RUN" = "true" ] && DRY_FLAG="--dry-run"
+          python scripts/iras_prospect.py \
+            --batch-id "$BATCH_ID" \
+            --limit "$LEAD_LIMIT" \
+            $DRY_FLAG
 
       - name: Emit step summary
         run: |
@@ -211,10 +171,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install --quiet \
-            httpx openai anthropic supabase \
-            python-dotenv pydantic structlog
+        run: pip install --quiet httpx openai anthropic supabase python-dotenv structlog
 
       - name: Run Enrichment Agent
         id: enrich_run
@@ -235,21 +192,39 @@ jobs:
 
           enriched_count = 0
           for lead in leads:
-              perp_response = httpx.post("https://api.perplexity.ai/chat/completions",
-                  headers={"Authorization": f"Bearer {os.environ['PERPLEXITY_API_KEY']}"},
-                  json={"model": "sonar-pro", "messages": [{"role": "user", "content":
-                      f"Research contractor pain points for {lead.get('company_name','unknown')} "
-                      f"in DFW. Focus on: recent projects, tech adoption gaps, revenue signals. "
-                      f"Return JSON: {{pain_signals: [], news: [], score_boost: 0-20}}"
-                  }]}
-              ).json()
+              try:
+                  perp_response = httpx.post("https://api.perplexity.ai/chat/completions",
+                      headers={"Authorization": f"Bearer {os.environ['PERPLEXITY_API_KEY']}"},
+                      json={"model": "sonar-pro", "messages": [{"role": "user", "content":
+                          f"Research this DFW roofing contractor: {lead.get('company_name','unknown')}. "
+                          f"Find: recent storm/hail jobs, Yelp/Google reviews mentioning tech issues, "
+                          f"whether they use any CRM or estimating software, owner name if findable. "
+                          f"Return JSON: {{pain_signals: [], owner_name: string|null, tech_stack: [], score_boost: 0-20}}"
+                      }]},
+                      timeout=20
+                  ).json()
 
-              pain_data = perp_response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                  pain_data = perp_response.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+              except Exception as e:
+                  print(f"[ENRICH] Perplexity error for {lead.get('company_name')}: {e}")
+                  pain_data = "{}"
+
+              # Try to parse owner name for personalization
+              try:
+                  parsed = json.loads(pain_data)
+                  owner_name = parsed.get("owner_name")
+                  score_boost = min(int(parsed.get("score_boost", 0)), 20)
+              except Exception:
+                  owner_name = None
+                  score_boost = 0
 
               supabase.table("iras_leads").update({
                   "status": "enriched",
                   "pain_data": pain_data,
-                  "enriched_at": "now()"
+                  "enriched_at": "now()",
+                  "first_name": owner_name.split()[0] if owner_name else None,
+                  "last_name": " ".join(owner_name.split()[1:]) if owner_name and len(owner_name.split()) > 1 else None,
+                  "score": min(20 + score_boost, 40),
               }).eq("id", lead["id"]).execute()
               enriched_count += 1
 
@@ -292,7 +267,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install --quiet httpx openai supabase python-dotenv sendgrid jinja2 structlog
+        run: pip install --quiet httpx openai supabase python-dotenv sendgrid structlog
 
       - name: Run Outreach Agent
         id: outreach_run
@@ -302,7 +277,7 @@ jobs:
           from supabase import create_client
           from openai import OpenAI
           import sendgrid
-          from sendgrid.helpers.mail import Mail
+          from sendgrid.helpers.mail import Mail, CustomArg
 
           supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
           openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -312,47 +287,65 @@ jobs:
           batch_id = "${{ needs.enrich.outputs.batch_id }}"
           leads = [] if dry_run else supabase.table("iras_leads").select("*").eq("batch_id", batch_id).eq("status", "enriched").execute().data
 
+          # Skip leads without email
+          leads = [l for l in leads if l.get("email")]
+
           SEQUENCE = [
-              {"day": 0,  "template": "day0_intro",    "subject": "Quick question about your ops, {first_name}"},
-              {"day": 3,  "template": "day3_value",    "subject": "The DFW contractor gap I keep seeing"},
-              {"day": 7,  "template": "day7_proof",    "subject": "What 3 DFW contractors did in 30 days"},
-              {"day": 14, "template": "day14_breakup", "subject": "Closing the loop, {first_name}"},
+              {"day": 0,  "subject": "Quick question about your ops, {first_name}"},
+              {"day": 3,  "subject": "The DFW contractor gap I keep seeing"},
+              {"day": 7,  "subject": "What 3 DFW contractors did in 30 days"},
+              {"day": 14, "subject": "Closing the loop, {first_name}"},
           ]
 
           emails_sent = 0
           for lead in leads:
+              first = lead.get("first_name") or "there"
+              company = lead.get("company_name") or "your company"
               pain_context = lead.get("pain_data", "{}")
 
-              personalized = openai_client.chat.completions.create(
-                  model="gpt-4o",
-                  messages=[{
-                      "role": "system",
-                      "content": "You are a DFW contractor outreach specialist for Garcar Enterprise. Write concise, personalized cold emails. Max 120 words. No generic openers."
-                  }, {
-                      "role": "user",
-                      "content": f"Write a Day 0 intro email for {lead.get('first_name','there')} at {lead.get('company_name','their company')}. Pain context: {pain_context}. CTA: book a 15-min call."
-                  }]
-              ).choices[0].message.content
+              try:
+                  body = openai_client.chat.completions.create(
+                      model="gpt-4o",
+                      messages=[{
+                          "role": "system",
+                          "content": (
+                              "You write cold outreach emails for Garcar Enterprise, "
+                              "targeting DFW roofing contractor owners. "
+                              "Max 120 words. First line must reference something specific about them. "
+                              "No generic openers. No 'I hope this email finds you well'. "
+                              "CTA: book a 15-min call."
+                          )
+                      }, {
+                          "role": "user",
+                          "content": f"Write Day 0 intro email for {first} at {company}. Pain context: {pain_context}"
+                      }]
+                  ).choices[0].message.content
+              except Exception as e:
+                  print(f"[OUTREACH] OpenAI error for {lead.get('email')}: {e}")
+                  continue
 
               if not dry_run:
-                  msg = Mail(
-                      from_email=os.environ["SENDGRID_FROM_EMAIL"],
-                      to_emails=lead.get("email"),
-                      subject=f"Quick question about your ops, {lead.get('first_name','there')}",
-                      plain_text_content=personalized
-                  )
-                  msg.custom_arg = sendgrid.helpers.mail.CustomArg("lead_id", lead["id"])
-                  msg.custom_arg = sendgrid.helpers.mail.CustomArg("batch_id", batch_id)
-                  msg.custom_arg = sendgrid.helpers.mail.CustomArg("sequence_day", "0")
-                  sg.send(msg)
+                  try:
+                      msg = Mail(
+                          from_email=os.environ["SENDGRID_FROM_EMAIL"],
+                          to_emails=lead["email"],
+                          subject=f"Quick question about your ops, {first}",
+                          plain_text_content=body
+                      )
+                      msg.add_custom_arg(CustomArg("lead_id", lead["id"]))
+                      msg.add_custom_arg(CustomArg("batch_id", batch_id))
+                      msg.add_custom_arg(CustomArg("sequence_day", "0"))
+                      sg.send(msg)
 
-                  supabase.table("iras_leads").update({
-                      "status": "outreach_day0",
-                      "outreach_enrolled_at": "now()",
-                      "email_sequence": json.dumps(SEQUENCE)
-                  }).eq("id", lead["id"]).execute()
+                      supabase.table("iras_leads").update({
+                          "status": "outreach_day0",
+                          "outreach_enrolled_at": "now()",
+                          "email_sequence": json.dumps(SEQUENCE)
+                      }).eq("id", lead["id"]).execute()
 
-                  emails_sent += 1
+                      emails_sent += 1
+                  except Exception as e:
+                      print(f"[OUTREACH] Send error for {lead.get('email')}: {e}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"emails_sent={emails_sent}\n")
@@ -379,7 +372,8 @@ jobs:
         (needs.outreach.result == 'success') ||
         (github.event_name == 'repository_dispatch' && (
           github.event.action == 'sendgrid_email_opened' ||
-          github.event.action == 'sendgrid_link_clicked'
+          github.event.action == 'sendgrid_link_clicked' ||
+          github.event.action == 'sendgrid_suppressed'
         )) ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.start_step == '4')
       )
@@ -409,7 +403,52 @@ jobs:
           supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
           dry_run = os.environ["DRY_RUN"] == "true"
           HOT_THRESHOLD = int(os.environ["HOT_LEAD_THRESHOLD"])
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          event_action = "${{ github.event.action }}"
 
+          # Handle suppression events immediately
+          if event_action == "sendgrid_suppressed":
+              lead_id = "${{ github.event.client_payload.lead_id }}"
+              if lead_id and not dry_run:
+                  supabase.table("iras_leads").update({"status": "suppressed"}).eq("id", lead_id).execute()
+              print(f"[SCORE] Lead {lead_id} suppressed")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("hot_leads_count=0\n")
+              exit(0)
+
+          # Single-lead scoring from webhook
+          if event_name == "repository_dispatch" and event_action in ("sendgrid_email_opened", "sendgrid_link_clicked"):
+              lead_id = "${{ github.event.client_payload.lead_id }}"
+              if lead_id and not dry_run:
+                  lead = supabase.table("iras_leads").select("id,score,status").eq("id", lead_id).single().execute().data
+                  if lead:
+                      score = lead.get("score", 20)
+                      score += 15 if event_action == "sendgrid_link_clicked" else 10
+                      score = min(score, 100)
+                      new_status = "hot" if score >= HOT_THRESHOLD else lead["status"]
+                      supabase.table("iras_leads").update({"score": score, "status": new_status, "scored_at": "now()"}).eq("id", lead_id).execute()
+
+                      if score >= HOT_THRESHOLD:
+                          httpx.post("https://api.linear.app/graphql",
+                              headers={"Authorization": os.environ["LINEAR_API_KEY"]},
+                              json={"query": '''mutation CreateIssue($input: IssueCreateInput!) {
+                                  issueCreate(input: $input) { issue { id identifier } }
+                              }''', "variables": {"input": {
+                                  "teamId": os.environ["LINEAR_TEAM_ID"],
+                                  "title": f"HOT LEAD: {lead_id} (score={score})",
+                                  "priority": 1
+                              }}}
+                          )
+                          print(f"[SCORE] HOT: lead {lead_id} score={score}")
+                          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                              f.write("hot_leads_count=1\n")
+                          exit(0)
+
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("hot_leads_count=0\n")
+              exit(0)
+
+          # Batch scoring (post-outreach)
           leads = [] if dry_run else supabase.table("iras_leads").select("*").in_("status", [
               "outreach_day0", "outreach_day3", "outreach_day7", "outreach_day14"
           ]).execute().data
@@ -417,37 +456,9 @@ jobs:
           hot_leads_count = 0
           for lead in leads:
               score = lead.get("score", 20)
-
-              if os.environ.get("GITHUB_EVENT_NAME") == "repository_dispatch":
-                  event_action = "${{ github.event.action }}"
-                  if event_action == "sendgrid_link_clicked":
-                      score = min(score + 15, 100)
-                  elif event_action == "sendgrid_email_opened":
-                      score = min(score + 10, 100)
-
-              if not dry_run:
-                  new_status = "hot" if score >= HOT_THRESHOLD else lead["status"]
-                  supabase.table("iras_leads").update({
-                      "score": score,
-                      "status": new_status,
-                      "scored_at": "now()"
-                  }).eq("id", lead["id"]).execute()
-
-              if score >= HOT_THRESHOLD:
+              if score >= HOT_THRESHOLD and not dry_run:
+                  supabase.table("iras_leads").update({"status": "hot", "scored_at": "now()"}).eq("id", lead["id"]).execute()
                   hot_leads_count += 1
-                  if not dry_run:
-                      httpx.post("https://api.linear.app/graphql",
-                          headers={"Authorization": os.environ["LINEAR_API_KEY"]},
-                          json={"query": '''mutation CreateIssue($input: IssueCreateInput!) {
-                              issueCreate(input: $input) { issue { id identifier } }
-                          }''', "variables": {"input": {
-                              "teamId": os.environ["LINEAR_TEAM_ID"],
-                              "title": f"HOT LEAD: {lead.get('first_name')} @ {lead.get('company_name')} (score={score})",
-                              "description": f"Lead ID: {lead['id']}\nEmail: {lead.get('email')}\nPhone: {lead.get('phone')}\nScore: {score}\n\nNext: Send demo invite + Calendly link",
-                              "priority": 1
-                          }}}
-                      )
-                  print(f"[SCORE] HOT LEAD: {lead.get('email')} — score={score}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"hot_leads_count={hot_leads_count}\n")
@@ -489,7 +500,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install --quiet httpx openai supabase python-dotenv sendgrid jinja2 structlog
+        run: pip install --quiet httpx openai supabase python-dotenv sendgrid structlog
 
       - name: Run Conversion Agent
         id: convert_run
@@ -511,30 +522,40 @@ jobs:
 
           demos_scheduled = 0
           for lead in hot_leads:
-              proposal = openai_client.chat.completions.create(
-                  model="gpt-4o",
-                  messages=[{"role": "system", "content":
-                      "You are a Garcar Enterprise sales agent. Write a brief, compelling demo invite. Include the Calendly link naturally. Max 80 words."
-                  }, {"role": "user", "content":
-                      f"Write a demo invite for {lead.get('first_name')} at {lead.get('company_name')}. They scored {lead.get('score')}. Pain context: {lead.get('pain_data','')}. Include calendly link: {CALENDLY_LINK}"
-                  }]
-              ).choices[0].message.content
+              first = lead.get("first_name") or "there"
+              company = lead.get("company_name") or "your company"
+
+              try:
+                  proposal = openai_client.chat.completions.create(
+                      model="gpt-4o",
+                      messages=[{"role": "system", "content":
+                          "Garcar Enterprise sales agent. Write a brief demo invite. Include Calendly link naturally. Max 80 words. Be specific to their business."
+                      }, {"role": "user", "content":
+                          f"Demo invite for {first} at {company}. Score: {lead.get('score')}. Pain: {lead.get('pain_data','')}. Calendly: {CALENDLY_LINK}"
+                      }]
+                  ).choices[0].message.content
+              except Exception as e:
+                  print(f"[CONVERT] OpenAI error: {e}")
+                  continue
 
               if not dry_run:
-                  msg = Mail(
-                      from_email=os.environ["SENDGRID_FROM_EMAIL"],
-                      to_emails=lead.get("email"),
-                      subject=f"Let's talk — 15 min to show you what we built, {lead.get('first_name','there')}",
-                      plain_text_content=proposal
-                  )
-                  sg.send(msg)
+                  try:
+                      msg = Mail(
+                          from_email=os.environ["SENDGRID_FROM_EMAIL"],
+                          to_emails=lead["email"],
+                          subject=f"15 min to show you what we built, {first}",
+                          plain_text_content=proposal
+                      )
+                      sg.send(msg)
 
-                  supabase.table("iras_leads").update({
-                      "status": "demo_invited",
-                      "demo_invited_at": "now()"
-                  }).eq("id", lead["id"]).execute()
+                      supabase.table("iras_leads").update({
+                          "status": "demo_invited",
+                          "demo_invited_at": "now()"
+                      }).eq("id", lead["id"]).execute()
 
-                  demos_scheduled += 1
+                      demos_scheduled += 1
+                  except Exception as e:
+                      print(f"[CONVERT] Send error: {e}")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"demos_scheduled={demos_scheduled}\n")
@@ -546,7 +567,6 @@ jobs:
         run: |
           echo "## Step 5 — Conversion Agent" >> $GITHUB_STEP_SUMMARY
           echo "- **Demo invites sent:** ${{ steps.convert_run.outputs.demos_scheduled }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **CTA:** Calendly 15-min demo" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** Complete" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================
@@ -581,7 +601,7 @@ jobs:
         id: bill_run
         run: |
           python - << 'EOF'
-          import os, json, stripe
+          import os, stripe
           from supabase import create_client
 
           stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
@@ -589,11 +609,12 @@ jobs:
           dry_run = os.environ["DRY_RUN"] == "true"
 
           PRODUCTS = {
+              "garcar-audit-47":    {"price": 4700,   "mode": "payment",      "name": "Garcar Starter Audit"},
               "garcar-audit-299":   {"price": 29900,  "mode": "payment",      "name": "AI Automation Audit"},
+              "garcar-starter-497": {"price": 49700,  "mode": "payment",      "name": "Garcar Deep-Dive $497"},
               "garcar-starter-500": {"price": 50000,  "mode": "subscription", "name": "Garcar Starter $500/mo"},
               "garcar-pro-2000":    {"price": 200000, "mode": "subscription", "name": "Garcar Pro $2000/mo"},
               "dfwdata-197":        {"price": 19700,  "mode": "payment",      "name": "DFW Contractor Database"},
-              "dfwdata-97mo":       {"price": 9700,   "mode": "subscription", "name": "DFW Data $97/mo"},
               "sprint-deposit-5000":{"price": 500000, "mode": "payment",      "name": "30-Day Sprint Deposit"},
           }
 
@@ -606,14 +627,11 @@ jobs:
               product = PRODUCTS.get(product_id, PRODUCTS["garcar-starter-500"])
 
               customers = stripe.Customer.list(email=lead["email"]).data
-              if customers:
-                  customer = customers[0]
-              else:
-                  customer = stripe.Customer.create(
-                      email=lead["email"],
-                      name=f"{lead.get('first_name','')} {lead.get('last_name','')}",
-                      metadata={"lead_id": lead_id, "batch_id": lead.get("batch_id")}
-                  )
+              customer = customers[0] if customers else stripe.Customer.create(
+                  email=lead["email"],
+                  name=f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+                  metadata={"lead_id": lead_id}
+              )
 
               price = stripe.Price.create(
                   unit_amount=product["price"],
@@ -637,7 +655,7 @@ jobs:
               print(f"[BILL] Payment link: {payment_link.url}")
 
           elif dry_run:
-              print("[BILL] Dry run — skipping Stripe calls")
+              print("[BILL] Dry run — skipping Stripe")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"invoices_created={invoices_created}\n")
@@ -647,7 +665,6 @@ jobs:
         run: |
           echo "## Step 6 — Billing Agent" >> $GITHUB_STEP_SUMMARY
           echo "- **Invoices created:** ${{ steps.bill_run.outputs.invoices_created }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Products:** audit-299 | starter-500 | pro-2000 | data-197 | data-97mo | sprint-5000" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** Complete" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================
@@ -682,7 +699,7 @@ jobs:
         id: onboard_run
         run: |
           python - << 'EOF'
-          import os, json, secrets, hashlib, httpx, stripe
+          import os, secrets, hashlib, httpx, stripe
           from supabase import create_client
           from openai import OpenAI
           import sendgrid
@@ -715,27 +732,24 @@ jobs:
                   "onboarded_at": "now()"
               }).execute()
 
-              supabase.table("iras_leads").update({
-                  "status": "customer",
-                  "converted_at": "now()"
-              }).eq("id", lead["id"]).execute()
+              supabase.table("iras_leads").update({"status": "customer", "converted_at": "now()"}).eq("id", lead["id"]).execute()
 
-              welcome_email = openai_client.chat.completions.create(
+              first = lead.get("first_name") or "there"
+              welcome = openai_client.chat.completions.create(
                   model="gpt-4o",
                   messages=[{"role": "system", "content":
-                      "You are Garcar Enterprise's onboarding AI. Write a warm, specific welcome email. Include next steps. Max 150 words."
+                      "Garcar Enterprise onboarding AI. Warm, specific welcome email. Include next steps. Max 150 words."
                   }, {"role": "user", "content":
-                      f"Write welcome email for {lead.get('first_name')} at {lead.get('company_name')} who just subscribed to {product_id}. Include their API key (masked): {api_key[:12]}... and link to dashboard: https://garcar.io/dashboard"
+                      f"Welcome {first} at {lead.get('company_name')} to {product_id}. API key (masked): {api_key[:12]}... Dashboard: https://garcar.io/dashboard"
                   }]
               ).choices[0].message.content
 
-              msg = Mail(
+              sg.send(Mail(
                   from_email=os.environ["SENDGRID_FROM_EMAIL"],
                   to_emails=lead["email"],
-                  subject=f"Welcome to Garcar Enterprise, {lead.get('first_name','there')}",
-                  plain_text_content=welcome_email
-              )
-              sg.send(msg)
+                  subject=f"Welcome to Garcar Enterprise, {first}",
+                  plain_text_content=welcome
+              ))
 
               httpx.post("https://api.linear.app/graphql",
                   headers={"Authorization": os.environ["LINEAR_API_KEY"]},
@@ -743,17 +757,17 @@ jobs:
                       issueCreate(input: $input) { issue { id identifier } }
                   }''', "variables": {"input": {
                       "teamId": os.environ["LINEAR_TEAM_ID"],
-                      "title": f"NEW CUSTOMER: {lead.get('first_name')} @ {lead.get('company_name')} — {product_id}",
-                      "description": f"Customer ID: {stripe_customer_id}\nPlan: {product_id}\nEmail: {lead['email']}\nOnboarded: today\n\nNext: 30-day check-in scheduled",
+                      "title": f"NEW CUSTOMER: {first} @ {lead.get('company_name')} — {product_id}",
+                      "description": f"Plan: {product_id}\nEmail: {lead['email']}\nNext: 30-day check-in",
                       "priority": 2
                   }}}
               )
 
               customers_onboarded = 1
-              print(f"[ONBOARD] Customer {lead.get('email')} provisioned on {product_id}")
+              print(f"[ONBOARD] {lead.get('email')} provisioned on {product_id}")
 
           elif dry_run:
-              print("[ONBOARD] Dry run — skipping provisioning")
+              print("[ONBOARD] Dry run — skipping")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"customers_onboarded={customers_onboarded}\n")
@@ -763,7 +777,7 @@ jobs:
         run: |
           echo "## Step 7 — Onboarding Agent" >> $GITHUB_STEP_SUMMARY
           echo "- **Customers onboarded:** ${{ steps.onboard_run.outputs.customers_onboarded }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Actions:** API key provisioned | Welcome email sent | Linear issue created | Dashboard access granted" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actions:** API key provisioned | Welcome email | Linear issue | Dashboard access" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** Complete" >> $GITHUB_STEP_SUMMARY
 
   # ============================================================
@@ -790,14 +804,4 @@ jobs:
           echo "| 6 | Billing     | ${{ needs.bill.result }}    | ${{ needs.bill.outputs.invoices_created || 'n/a' }} invoices |" >> $GITHUB_STEP_SUMMARY
           echo "| 7 | Onboarding  | ${{ needs.onboard.result }} | ${{ needs.onboard.outputs.customers_onboarded || 'n/a' }} customers |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> **Dry Run:** ${{ env.DRY_RUN }}" >> $GITHUB_STEP_SUMMARY
-          echo "> **Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "> **Hot Lead Threshold:** ${{ env.HOT_LEAD_THRESHOLD }}" >> $GITHUB_STEP_SUMMARY
-
-      - name: Notify Linear — Pipeline Complete
-        if: success()
-        run: |
-          curl -s -X POST https://api.linear.app/graphql \
-            -H "Authorization: ${{ secrets.LINEAR_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d '{"query": "mutation { commentCreate(input: { body: \"IRAS pipeline run complete\" }) { comment { id } } }"}' || true
+          echo "> Dry Run: ${{ env.DRY_RUN }} | Triggered by: ${{ github.event_name }} | Hot threshold: ${{ env.HOT_LEAD_THRESHOLD }}" >> $GITHUB_STEP_SUMMARY
