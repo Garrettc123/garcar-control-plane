@@ -1,0 +1,23 @@
+name: Notify dispatch
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    if: vars.DISPATCH_URL != ''
+    steps:
+      - name: Emit push event to garcar-dispatch
+        run: |
+          curl -sf -X POST "${{ vars.DISPATCH_URL }}/dispatch" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg et 'github.push' \
+              --arg repo '${{ github.repository }}' \
+              --arg branch '${{ github.ref_name }}' \
+              --arg sha '${{ github.sha }}' \
+              --arg actor '${{ github.actor }}' \
+              '{event_type:$et,source_system:"github-actions",repo:$repo,branch:$branch,commit_sha:$sha,actor:$actor}')" \
+            || true
