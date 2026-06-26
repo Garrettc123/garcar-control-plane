@@ -3,9 +3,27 @@
 
 import os
 import json
+import sys
 import uuid
 import requests
 from datetime import datetime, timezone
+
+_REQUIRED = ["NOTION_TOKEN", "SUPABASE_URL", "SUPABASE_SERVICE_KEY"]
+print("=== Secret check ===", flush=True)
+_missing = []
+for _s in _REQUIRED:
+    _val = os.environ.get(_s, "")
+    print(f"  {'SET   ' if _val else 'MISSING'}: {_s}", flush=True)
+    if not _val:
+        _missing.append(_s)
+if _missing:
+    print(f"\nERROR: {len(_missing)} required secret(s) not set in garcar-control-plane repository secrets.", flush=True)
+    print("Go to: https://github.com/Garrettc123/garcar-control-plane/settings/secrets/actions", flush=True)
+    print("Add under 'Repository secrets' (NOT under any environment):", flush=True)
+    for _s in _missing:
+        print(f"  {_s}", flush=True)
+    sys.exit(1)
+print("=== All secrets present ===", flush=True)
 
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_CRM_DB_ID = os.environ.get("NOTION_CRM_DB_ID", "8583f88b-69c8-4b55-9c1e-c32783d68ac1")
